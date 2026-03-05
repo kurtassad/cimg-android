@@ -7,11 +7,91 @@ parameters:
     type: boolean
     default: false
 
+jobs:
+  test-feed-script:
+    docker:
+      - image: cimg/android:2023.11.1
+    steps:
+      - checkout
+      - run:
+          name: Run androidFeed.sh (dry run)
+          command: |
+            git submodule update --init --recursive
+            cd shared && git checkout main && cd ..
+            source shared/automated-updates.sh
+            generateDatedTags
+            RELEASE=$RELEASE.1
+            echo "RELEASE=$RELEASE"
+
+            sdkmanager --update
+
+            CLT_VERSION=$(curl -s https://developer.android.com/studio#command-line-tools-only | grep "commandlinetools-linux" | grep -o '[0-9]\+'| tr -d '[:blank:]' | head -1)
+            echo "Command Line Tools version: $CLT_VERSION"
+
+            gcloud components update --quiet
+            GCLOUD_VERSION=$(gcloud version | head -1 | sed 's/[^0-9.]//g')
+            echo "Gcloud version: $GCLOUD_VERSION"
+
+            GRADLE_VERSION=$(curl --silent "https://api.github.com/repos/gradle/gradle/releases/latest" | jq -r .name | sed 's/^[^0-9]*//')
+            echo "Gradle version: $GRADLE_VERSION"
+
+            MAVEN_VERSION=$(curl --silent "https://api.github.com/repos/apache/maven/releases/latest" | jq -r .tag_name | sed 's/^[^0-9]*//')
+            echo "Maven version: $MAVEN_VERSION"
+
+            FASTLANE_VERSION=$(curl --silent "https://api.github.com/repos/fastlane/fastlane/releases/latest" | jq -r .tag_name)
+            echo "Fastlane version: $FASTLANE_VERSION"
+
+            NON_RC_BT=$(sdkmanager --list | grep "build-tools" | awk -F';' '{print $2}' | awk -F'|' '{print $1}' | tr -d '[:blank:]' | grep -v 'rc')
+            LATEST_STABLE_BT=$(echo "$NON_RC_BT" | sort -Vr | head -1)
+            BASE_RELEASES_BT=$(echo "$NON_RC_BT" | grep '\.0\.0$' | sort -Vr | head -3)
+            BUILD_TOOLS_VERSIONS=$(printf '%s\n%s' "$LATEST_STABLE_BT" "$BASE_RELEASES_BT" | sort -Vr | uniq | head -n 4)
+
+            readarray -t BUILD_TOOLS_ARRAY <<< "$BUILD_TOOLS_VERSIONS"
+            echo "Build tools selected: ${BUILD_TOOLS_ARRAY[*]}"
+
+            PLATFORMS=$(sdkmanager --list | grep "platforms;android" | cut -d'|' -f1 | grep -v 'Sandbox' | grep -v 'ext' | sort -t- -nk2 | tr -d '[:blank:]' | awk -F- '!seen[$NF]++' | tail -7)
+            readarray -t PLATFORMS_ARRAY <<< "$PLATFORMS"
+            echo "Platforms selected: ${PLATFORMS_ARRAY[*]}"
+
+            sed -i '38c\ENV MAVEN_VERSION='"$MAVEN_VERSION"'' Dockerfile.template
+            sed -i '48c\ENV GRADLE_VERSION='"$GRADLE_VERSION"'' Dockerfile.template
+            sed -i '62c\RUN SDK_TOOLS_URL="https://dl.google.com/android/repository/commandlinetools-linux-'"$CLT_VERSION"'_latest.zip" && \\' Dockerfile.template
+            sed -i '73c\    echo y | ${CMDLINE_TOOLS_ROOT}/sdkmanager "build-tools;'"${BUILD_TOOLS_ARRAY[0]}"'" && \\' Dockerfile.template
+            sed -i '74c\    echo y | ${CMDLINE_TOOLS_ROOT}/sdkmanager "build-tools;'"${BUILD_TOOLS_ARRAY[1]}"'" && \\' Dockerfile.template
+            sed -i '75c\    echo y | ${CMDLINE_TOOLS_ROOT}/sdkmanager "build-tools;'"${BUILD_TOOLS_ARRAY[2]}"'" && \\' Dockerfile.template
+            sed -i '76c\    echo y | ${CMDLINE_TOOLS_ROOT}/sdkmanager "build-tools;'"${BUILD_TOOLS_ARRAY[3]}"'"' Dockerfile.template
+            sed -i '77c\RUN echo y | ${CMDLINE_TOOLS_ROOT}/sdkmanager "'"${PLATFORMS_ARRAY[0]}"'" && \\' Dockerfile.template
+            sed -i '78c\    echo y | ${CMDLINE_TOOLS_ROOT}/sdkmanager "'"${PLATFORMS_ARRAY[1]}"'" && \\' Dockerfile.template
+            sed -i '79c\    echo y | ${CMDLINE_TOOLS_ROOT}/sdkmanager "'"${PLATFORMS_ARRAY[2]}"'" && \\' Dockerfile.template
+            sed -i '80c\    echo y | ${CMDLINE_TOOLS_ROOT}/sdkmanager "'"${PLATFORMS_ARRAY[3]}"'" && \\' Dockerfile.template
+            sed -i '81c\    echo y | ${CMDLINE_TOOLS_ROOT}/sdkmanager "'"${PLATFORMS_ARRAY[4]}"'" && \\' Dockerfile.template
+            sed -i '82c\    echo y | ${CMDLINE_TOOLS_ROOT}/sdkmanager "'"${PLATFORMS_ARRAY[5]}"'" && \\' Dockerfile.template
+            sed -i '83c\    echo y | ${CMDLINE_TOOLS_ROOT}/sdkmanager "'"${PLATFORMS_ARRAY[6]}"'"' Dockerfile.template
+            sed -i '89c\    sudo gem install fastlane --version '"$FASTLANE_VERSION"' --no-document && \\' Dockerfile.template
+            sed -i '94c\ENV GCLOUD_VERSION='"$GCLOUD_VERSION"'-0' Dockerfile.template
+
+            echo ""
+            echo "=== Resulting Dockerfile.template ==="
+            cat -n Dockerfile.template
+
+            echo ""
+            echo "=== Generating Dockerfiles ==="
+            shared/gen-dockerfiles.sh "$RELEASE"
+
+            echo ""
+            echo "=== Generated Dockerfile ==="
+            cat -n "$RELEASE/Dockerfile"
+
 workflows:
   main-wf:
     when:
       not: << pipeline.parameters.cron >>
     jobs:
+      - test-feed-script:
+          filters:
+            branches:
+              ignore:
+                - main
       - cimg/build-and-deploy:
           name: "Test"
           docker-namespace: ccitest
